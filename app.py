@@ -7,8 +7,9 @@ Serve o front-end (index.html) e expõe dois endpoints que o JS consome:
   GET /api/apostadores?debug=1  -> inclui "tentativas" com o diagnóstico de cada URL
   GET /api/placar               -> {"state","br","jp","clock","detail","kickoff","completed"}
 
-O Python é quem busca a planilha (com pandas) e o placar (ESPN) do lado do
-servidor, então o navegador não esbarra em CORS.
+O Python busca a planilha (com pandas) e o placar (ESPN) do lado do servidor,
+então o navegador não esbarra em CORS. O parser PROCURA a linha de cabeçalho
+(NOME/BRASIL/JAPÃO), então funciona mesmo com um título/banner acima dela.
 
 Variáveis de ambiente (opcionais): SHEET_ID, SHEET_GID, PORT.
 """
@@ -31,7 +32,6 @@ SHEET_ID = os.environ.get("SHEET_ID", "1TmzlKRFlDtFZXgZxNpQff8bLY1lWU7tkeVn9lPwV
 SHEET_GID = os.environ.get("SHEET_GID", "")
 _gid = f"&gid={SHEET_GID}" if SHEET_GID else ""
 
-# export?format=csv primeiro (mais previsível); gviz como alternativa
 SHEET_URLS = [
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv{_gid}",
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv{_gid}",
@@ -62,20 +62,60 @@ def _norm(s):
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 
+def _parse_matrix(text):
+    """Lê o CSV como matriz, ACHA a coluna NOME e lê a partir dela.
+    BRASIL/JAPAO são localizados na mesma linha do cabeçalho; se não
+    aparecerem, assume as duas colunas seguintes à de NOME."""
+    df = pd.read_csv(io.StringIO(text), header=None, dtype=str,
+                     keep_default_na=False, engine="python")
+    rows = df.values.tolist()
+
+    def is_nome(c):
+        # casa "NOME" exato ou grudado num título, ex.: "BOLAO MAGALHAES NOME"
+        return c == "NOME" or c.endswith(" NOME")
+
+    hdr = c_nome = c_br = c_jp = None
+    for idx, row in enumerate(rows):
+        cells = [_norm(c) for c in row]
+        for j, c in enumerate(cells):
+            if is_nome(c):
+                hdr, c_nome = idx, j
+                c_br = cells.index("BRASIL") if "BRASIL" in cells else j + 1
+                c_jp = cells.index("JAPAO") if "JAPAO" in cells else j + 2
+                break
+        if hdr is not None:
+            break
+    if hdr is None:
+        achei = [_norm(c) for c in (rows[0] if rows else [])]
+        return None, f"nao achei a coluna NOME. 1a linha: {achei}"
+
+    def cell(row, i):
+        return str(row[i]).strip() if (i is not None and i < len(row)) else ""
+
+    out = []
+    for row in rows[hdr + 1:]:
+        name = cell(row, c_nome)
+        if not name:
+            continue
+        try:
+            br = int(float(cell(row, c_br)))
+            jp = int(float(cell(row, c_jp)))
+        except (ValueError, TypeError):
+            continue
+        out.append({"name": name, "br": br, "jp": jp})
+
+    return (out or None), f"{len(out)} apostadores (NOME na linha {hdr + 1}, coluna {c_nome})"
+
+
 def fetch_bettors():
-    """Retorna (lista | None, tentativas[]). 'tentativas' explica o que houve em cada URL."""
+    """Retorna (lista | None, tentativas[])."""
     attempts = []
     for url in SHEET_URLS:
         try:
             r = requests.get(url, headers=UA, timeout=8)
-            # decodifica com utf-8-sig pra remover o BOM que o Google manda no CSV
-            text = r.content.decode("utf-8-sig", errors="replace")
-            info = {
-                "url": url,
-                "status": r.status_code,
-                "content_type": r.headers.get("content-type", ""),
-                "tamanho": len(text),
-            }
+            text = r.content.decode("utf-8-sig", errors="replace")  # remove BOM
+            info = {"url": url, "status": r.status_code,
+                    "content_type": r.headers.get("content-type", ""), "tamanho": len(text)}
             if r.status_code != 200:
                 attempts.append({**info, "nota": "status != 200"})
                 continue
@@ -83,30 +123,10 @@ def fetch_bettors():
             if head.startswith("<!doctype html") or head.startswith("<html"):
                 attempts.append({**info, "nota": "veio HTML (planilha provavelmente NAO esta publica)"})
                 continue
-
-            df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
-            colmap = {_norm(c): c for c in df.columns}
-            faltando = [k for k in ("NOME", "BRASIL", "JAPAO") if k not in colmap]
-            if faltando:
-                attempts.append({**info, "nota": f"colunas ausentes: {faltando}. Achei: {list(df.columns)}"})
-                continue
-
-            c_nome, c_br, c_jp = colmap["NOME"], colmap["BRASIL"], colmap["JAPAO"]
-            out = []
-            for _, row in df.iterrows():
-                name = str(row[c_nome]).strip()
-                if not name:
-                    continue
-                try:
-                    br = int(float(str(row[c_br]).strip()))
-                    jp = int(float(str(row[c_jp]).strip()))
-                except (ValueError, TypeError):
-                    continue
-                out.append({"name": name, "br": br, "jp": jp})
-
-            if out:
-                return out, attempts
-            attempts.append({**info, "nota": "0 linhas validas apos o parse"})
+            data, nota = _parse_matrix(text)
+            attempts.append({**info, "nota": nota})
+            if data:
+                return data, attempts
         except Exception as e:  # noqa: BLE001
             attempts.append({"url": url, "erro": repr(e)})
     return None, attempts
@@ -117,16 +137,17 @@ def apostadores():
     cached = cache_get("bettors", 60)
     if cached is not None:
         return jsonify({"apostadores": cached})
-
     data, attempts = fetch_bettors()
     if not data:
         payload = {"error": "sheet_unavailable", "apostadores": []}
         if request.args.get("debug"):
             payload["tentativas"] = attempts
         return jsonify(payload), 502
-
     cache_set("bettors", data)
-    return jsonify({"apostadores": data})
+    resp = {"apostadores": data}
+    if request.args.get("debug"):
+        resp["tentativas"] = attempts
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------- placar (ESPN)
