@@ -3,109 +3,129 @@ MagalBET — backend Flask
 ========================
 Serve o front-end (index.html) e expõe dois endpoints que o JS consome:
 
-  GET /api/apostadores  -> {"apostadores": [{"name","br","jp"}, ...]}
-  GET /api/placar       -> {"state","br","jp","clock","detail","kickoff","completed"}
+  GET /api/apostadores          -> {"apostadores": [{"name","br","jp"}, ...]}
+  GET /api/apostadores?debug=1  -> inclui "tentativas" com o diagnóstico de cada URL
+  GET /api/placar               -> {"state","br","jp","clock","detail","kickoff","completed"}
 
-Como o navegador fala só com ESTE servidor (mesma origem), não há problema de CORS:
-quem busca a planilha do Google e o placar da ESPN é o Python, do lado do servidor.
+O Python é quem busca a planilha (com pandas) e o placar (ESPN) do lado do
+servidor, então o navegador não esbarra em CORS.
 
-Configuração por variáveis de ambiente (todas opcionais):
-  SHEET_ID   -> id da planilha do Google (padrão: a do bolão)
-  SHEET_GID  -> gid de uma aba específica (padrão: 1ª aba)
-  PORT       -> porta (definida automaticamente por Render/Railway/Heroku)
+Variáveis de ambiente (opcionais): SHEET_ID, SHEET_GID, PORT.
 """
 
-import csv
 import io
 import os
 import time
+import unicodedata
 
+import pandas as pd
 import requests
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # libera o uso da API também a partir de outra origem, se você hospedar o HTML à parte
+CORS(app)
 
 # ---------------------------------------------------------------- config
 SHEET_ID = os.environ.get("SHEET_ID", "1TmzlKRFlDtFZXgZxNpQff8bLY1lWU7tkeVn9lPwV9Fo")
 SHEET_GID = os.environ.get("SHEET_GID", "")
 _gid = f"&gid={SHEET_GID}" if SHEET_GID else ""
-_gid_exp = f"&gid={SHEET_GID}" if SHEET_GID else ""
 
+# export?format=csv primeiro (mais previsível); gviz como alternativa
 SHEET_URLS = [
+    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv{_gid}",
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv{_gid}",
-    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv{_gid_exp}",
 ]
 ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
+UA = {"User-Agent": "Mozilla/5.0 (MagalBET/1.0)"}
 
-UA = {"User-Agent": "MagalBET/1.0 (+https://github.com)"}
-
-# ---------------------------------------------------------------- cache simples em memória
+# ---------------------------------------------------------------- cache simples
 _cache = {}
 
 
-def cached(key, ttl, producer):
-    """Evita martelar a planilha/ESPN a cada request: guarda o resultado por `ttl` segundos."""
-    now = time.time()
+def cache_get(key, ttl):
     hit = _cache.get(key)
-    if hit and (now - hit[0]) < ttl:
+    if hit and (time.time() - hit[0]) < ttl:
         return hit[1]
-    value = producer()
-    # só cacheia resultados bons (não cacheia falha, pra tentar de novo no próximo request)
-    if value is not None:
-        _cache[key] = (now, value)
-    return value
+    return None
 
 
-# ---------------------------------------------------------------- apostadores (planilha)
+def cache_set(key, value):
+    _cache[key] = (time.time(), value)
+
+
+# ---------------------------------------------------------------- apostadores (pandas)
 def _norm(s):
-    import unicodedata
-    s = (s or "").strip().upper()
+    """Tira BOM, acento e espaços; deixa MAIUSCULO. 'JAPAO' / BOM+'NOME' -> 'JAPAO' / 'NOME'."""
+    s = (str(s) if s is not None else "").replace("\ufeff", "").strip().upper()
     s = unicodedata.normalize("NFD", s)
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 
 def fetch_bettors():
+    """Retorna (lista | None, tentativas[]). 'tentativas' explica o que houve em cada URL."""
+    attempts = []
     for url in SHEET_URLS:
         try:
             r = requests.get(url, headers=UA, timeout=8)
-            if r.status_code != 200 or not r.text.strip():
+            # decodifica com utf-8-sig pra remover o BOM que o Google manda no CSV
+            text = r.content.decode("utf-8-sig", errors="replace")
+            info = {
+                "url": url,
+                "status": r.status_code,
+                "content_type": r.headers.get("content-type", ""),
+                "tamanho": len(text),
+            }
+            if r.status_code != 200:
+                attempts.append({**info, "nota": "status != 200"})
                 continue
-            rows = list(csv.reader(io.StringIO(r.text)))
-            if not rows:
+            head = text[:300].lstrip().lower()
+            if head.startswith("<!doctype html") or head.startswith("<html"):
+                attempts.append({**info, "nota": "veio HTML (planilha provavelmente NAO esta publica)"})
                 continue
-            header = [_norm(c) for c in rows[0]]
-            try:
-                i_name = header.index("NOME")
-                i_br = header.index("BRASIL")
-                i_jp = header.index("JAPAO")
-            except ValueError:
+
+            df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
+            colmap = {_norm(c): c for c in df.columns}
+            faltando = [k for k in ("NOME", "BRASIL", "JAPAO") if k not in colmap]
+            if faltando:
+                attempts.append({**info, "nota": f"colunas ausentes: {faltando}. Achei: {list(df.columns)}"})
                 continue
+
+            c_nome, c_br, c_jp = colmap["NOME"], colmap["BRASIL"], colmap["JAPAO"]
             out = []
-            for row in rows[1:]:
-                if len(row) <= max(i_name, i_br, i_jp):
+            for _, row in df.iterrows():
+                name = str(row[c_nome]).strip()
+                if not name:
                     continue
-                name = (row[i_name] or "").strip()
                 try:
-                    br = int((row[i_br] or "").strip())
-                    jp = int((row[i_jp] or "").strip())
-                except ValueError:
+                    br = int(float(str(row[c_br]).strip()))
+                    jp = int(float(str(row[c_jp]).strip()))
+                except (ValueError, TypeError):
                     continue
-                if name:
-                    out.append({"name": name, "br": br, "jp": jp})
+                out.append({"name": name, "br": br, "jp": jp})
+
             if out:
-                return out
-        except requests.RequestException:
-            continue
-    return None
+                return out, attempts
+            attempts.append({**info, "nota": "0 linhas validas apos o parse"})
+        except Exception as e:  # noqa: BLE001
+            attempts.append({"url": url, "erro": repr(e)})
+    return None, attempts
 
 
 @app.route("/api/apostadores")
 def apostadores():
-    data = cached("bettors", 60, fetch_bettors)
+    cached = cache_get("bettors", 60)
+    if cached is not None:
+        return jsonify({"apostadores": cached})
+
+    data, attempts = fetch_bettors()
     if not data:
-        return jsonify({"error": "sheet_unavailable", "apostadores": []}), 502
+        payload = {"error": "sheet_unavailable", "apostadores": []}
+        if request.args.get("debug"):
+            payload["tentativas"] = attempts
+        return jsonify(payload), 502
+
+    cache_set("bettors", data)
     return jsonify({"apostadores": data})
 
 
@@ -125,7 +145,7 @@ def fetch_placar():
                 st = ev.get("status") or comp.get("status") or {}
                 t = st.get("type", {})
                 return {
-                    "state": t.get("state"),          # pre | in | post
+                    "state": t.get("state"),
                     "br": int(bra.get("score") or 0),
                     "jp": int(jpn.get("score") or 0),
                     "clock": st.get("displayClock"),
@@ -140,9 +160,13 @@ def fetch_placar():
 
 @app.route("/api/placar")
 def placar():
-    data = cached("placar", 20, fetch_placar)
+    cached = cache_get("placar", 20)
+    if cached is not None:
+        return jsonify(cached)
+    data = fetch_placar()
     if data is None:
         return jsonify({"error": "espn_unavailable"}), 502
+    cache_set("placar", data)
     return jsonify(data)
 
 
@@ -158,5 +182,4 @@ def health():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
